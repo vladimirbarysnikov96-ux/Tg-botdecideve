@@ -491,7 +491,15 @@ def build_card(idea, f, admin):
     if cut:
         rows.append([B("📄 Показать полностью", f"full:{iid}")])
     rows.append(filter_row(f, iid))
-    rows.append([B("📋 Получить список", f"rpt:{f}:{iid}")])
+    # Кнопка доступна только если есть хотя бы одна выбранная идея.
+    with db() as con:
+        selected_count = con.execute(
+            "SELECT COUNT(*) FROM ideas WHERE status IN ('pending', 'chosen')"
+        ).fetchone()[0]
+    if selected_count:
+        rows.append([B(f"📋 Получить список ({selected_count})", f"rpt:{f}:{iid}")])
+    else:
+        rows.append([B("📋 Сначала выбери хотя бы одну идею", "noop")])
     if admin:
         rows.append([B("✏️ Изменить", f"edit:{iid}"), B("🗑 Удалить", f"del:{f}:{iid}")])
     rows.append([B("⬅️ В меню идей", "m:ideas")])
@@ -1404,41 +1412,43 @@ async def cb_report(call: CallbackQuery):
     if not await need_access(call):
         return
     f, iid = parse_fi(call.data)
+
+    # В отчёт входят только выбранные идеи (pending/chosen).
     with db() as con:
-        taken = con.execute("SELECT * FROM ideas WHERE status IN ('pending','chosen') ORDER BY id").fetchall()
-        declined = con.execute("SELECT * FROM ideas WHERE status='declined' ORDER BY id").fetchall()
-        free = con.execute("SELECT * FROM ideas WHERE status='new' ORDER BY id").fetchall()
-        new_ids = [r["id"] for r in taken if r["status"] == "pending"]
-        con.execute("UPDATE ideas SET status='chosen' WHERE status='pending'")
-        for i in new_ids:
-            con.execute("INSERT INTO actions(idea_id,user_id,action,created_at) VALUES(?,?,?,?)",
-                        (i, call.from_user.id, "included_in_report", now()))
+        selected = con.execute(
+            "SELECT * FROM ideas WHERE status IN ('pending', 'chosen') ORDER BY id"
+        ).fetchall()
 
-    def entries(mark, rows, with_new=False):
-        out = []
-        if not rows:
-            return ["<i>— нет —</i>"]
-        for r in rows:
-            pcs = esc_pieces(r["text"])
-            pcs[0] = f"{mark} <b>#{r['id']}</b> — {pcs[0]}"
-            suffix = ""
-            if r["status_by_name"]:
-                suffix += f"  <i>— {esc(short(r['status_by_name'], 30))}</i>"
-            if with_new and r["id"] in new_ids:
-                suffix += " 🆕"
-            pcs[-1] += suffix
-            out.extend(pcs)
-        return out
+        if not selected:
+            await ack(call, "Сначала выбери хотя бы одну идею.", alert=True)
+            await show_idea(call, f, iid, exact=False)
+            return
 
-    lines = ["📋 <b>ОБЩИЙ СПИСОК ИДЕЙ</b>", ""]
-    lines += [f"🟡 <b>ВЫБРАНЫ — {len(taken)}</b>"] + entries("🟡", taken, True) + [""]
-    lines += [f"🔴 <b>ОТКЛОНЕНЫ — {len(declined)}</b>"] + entries("🔴", declined) + [""]
-    lines += [f"🟢 <b>НЕ ТРОГАЛИ — {len(free)}</b>"] + entries("🟢", free)
+        new_ids = [r["id"] for r in selected if r["status"] == "pending"]
+        con.execute(
+            "UPDATE ideas SET status='chosen' WHERE status='pending'"
+        )
+        for idea_id in new_ids:
+            con.execute(
+                "INSERT INTO actions(idea_id,user_id,action,created_at) VALUES(?,?,?,?)",
+                (idea_id, call.from_user.id, "included_in_report", now()),
+            )
+
+    lines = [f"📋 <b>ВЫБРАННЫЕ ИДЕИ — {len(selected)}</b>", ""]
+    for idea in selected:
+        parts = esc_pieces(idea["text"])
+        parts[0] = f"🟡 <b>#{idea['id']}</b> — {parts[0]}"
+        if idea["status_by_name"]:
+            parts[-1] += f"  <i>— {esc(short(idea['status_by_name'], 30))}</i>"
+        if idea["id"] in new_ids:
+            parts[-1] += " 🆕"
+        lines.extend(parts)
+
     for chunk in pack(lines):
         await call.message.answer(chunk)
-    await show_idea(call, f, iid, exact=False)
-    await ack(call, "Список сформирован. Новые выбранные отмечены 🆕")
 
+    await show_idea(call, f, iid, exact=False)
+    await ack(call, "Отправлены только выбранные идеи ✅")
 
 @dp.callback_query(F.data.startswith("edit:"))
 async def cb_edit_begin(call: CallbackQuery):
