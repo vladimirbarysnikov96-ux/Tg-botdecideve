@@ -564,62 +564,383 @@ def norm_key(text):
     return re.sub(r"\s+", " ", text).casefold()
 
 
-# ───────────────────────── поиск похожих идей ─────────────────────────
+# ───────────────────────── поиск похожих идей (большой словарь + морфология) ─────────────────────────
 
-STOP = set("""и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по только ее мне
-было вот от меня еще нет о из ему теперь когда даже ну вдруг ли если уже или ни быть был него до вас нибудь
-опять уж вам ведь там потом себя ничего ей может они тут где есть надо ней для мы тебя их чем была сам чтоб
-без будто чего раз тоже себе под будет ж тогда кто этот того потому этого какой совсем ним здесь этом один
-почти мой тем чтобы нее сейчас были куда зачем всех никогда можно при наконец два об другой хоть после над
-больше тот через эти нас про всего них какая много разве три эту моя впрочем хорошо свою этой перед иногда
-лучше чуть том нельзя такой им более всегда конечно всю между это хотел добавить сделать игре игра игры
-майнкрафт майн minecraft мод нужно хочу было будут чтобы очень также еще""".split())
+STOP = set("""а без более будет будто бы в вам вас ведь во вот все всего всех вы где даже два для до его ей
+ее если есть еще ещё же за зачем здесь и из или им их к как какая какой когда кто ли мне меня
+может можно мой мы на надо над нами нас не него нее ней нет ни них но ну о об один он она они оно
+от очень по под при про раз разве с себе себя снова со так также там тебя тем то тогда того тоже
+только том тот ты у уж уже чем что чтобы эта эти это этом этот я
+добавить сделай сделать хочу нужно надо можно возможность функцию feature
+майнкрафт майн minecraft мод просто типа короче например пожалуйста вообще
+которые который которая которое через между после перед около рядом было бы хотелось бы""".split())
 
+try:
+    from _sim_data import ROOTS as _ROOTS, SUFFIXES as _SUFFIXES, GROUPS as _CONCEPT_LIST
+except ImportError:
+    import importlib.util, os as _os
+    _p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "_sim_data.py")
+    _spec = importlib.util.spec_from_file_location("_sim_data", _p)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _ROOTS, _SUFFIXES, _CONCEPT_LIST = _mod.ROOTS, _mod.SUFFIXES, _mod.GROUPS
+
+_ROOT_SET = set(_ROOTS)
+# префиксный индекс корней для быстрого поиска без миллионов ключей
+_PREFIX_INDEX = {}
+for _r in _ROOTS:
+    for _n in (4, 5, 6):
+        if len(_r) >= _n:
+            _PREFIX_INDEX.setdefault(_r[:_n], _r)
+
+def _build_morph_index():
+    """Совместимость: тяжёлый индекс больше не строится."""
+    return
+
+def _strip_suffix(token):
+    t = token.lower()
+    for suf in _SUFFIXES:
+        if suf and len(t) > len(suf) + 2 and t.endswith(suf):
+            return t[: -len(suf)]
+    return t
+
+_CONCEPT_INDEX = {}
+for _gi, _group in enumerate(_CONCEPT_LIST):
+    for _w in _group:
+        _CONCEPT_INDEX[_w] = _gi
+
+_MICRO_BASE = len(_CONCEPT_LIST)
+_ROOT_CONCEPT = {}
+for _i, _r in enumerate(_ROOTS):
+    if len(_r) >= 4:
+        _ROOT_CONCEPT[_r] = _MICRO_BASE + _i
+
+SYNONYMS = {
+    "фото": {"изображ", "картинк", "image", "photo", "picture", "pic", "img"},
+    "фон": {"background", "wallpaper", "обои", "backdrop", "bg"},
+    "кастом": {"custom", "свой", "свои", "пользовательск", "personal"},
+    "экран": {"screen", "gui", "меню", "интерфейс", "hud", "главн"},
+    "загруж": {"upload", "load", "став", "поставить", "установ", "загрузк"},
+    "прыж": {"jump", "подскок", "скач", "прыжок"},
+    "авто": {"auto", "автомат", "automatic", "автоматич"},
+    "карта": {"map", "minimap", "миникарт", "radar"},
+    "лаг": {"lag", "тормоз", "фриз", "stutter"},
+    "fps": {"фпс", "производител", "performance", "оптимиз"},
+    "летать": {"fly", "полёт", "полет", "flight", "лета"},
+    "дракон": {"dragon", "enderdragon"},
+    "босс": {"boss"},
+    "маги": {"magic", "spell", "заклин", "чар"},
+    "крафт": {"craft", "recipe", "рецепт"},
+    "скин": {"skin", "skinpack"},
+    "руда": {"ore", "алмаз", "diamond"},
+    "подсветк": {"highlight", "xray", "иксрей", "glow", "outline"},
+    "моб": {"mob", "монстр", "существ", "creature"},
+    "сервер": {"server", "online", "мультиплеер"},
+    "звук": {"sound", "music", "аудио", "sfx"},
+    "кнопк": {"button", "btn", "клавиш"},
+    "меню": {"menu", "gui", "ui", "интерфейс"},
+}
 
 def words(text):
     return re.findall(r"[a-zа-я0-9]+", text.lower().replace("ё", "е"))
 
+def stem(w):
+    w = w.lower().replace("ё", "е")
+    if len(w) <= 3:
+        return w
+    for suf in (
+        "иями","ями","ами","иях","ях","ием","ом","ем","ой","ей","ию","ью",
+        "ую","юю","ая","яя","ое","ее","ые","ие","ых","их","ым","им",
+        "ить","ать","ять","еть","уть","ешь","ишь","ете","ите","ают","яют",
+        "ает","яет","ует","ит","ыл","ила","ило","или","ала","ало","али",
+        "ние","нья","ция","ность","ение","тель","ость","ическ","еск",
+        "ing","tion","ness","ment","able","ible","ers","ies","ied","ed","ly",
+    ):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            w = w[: -len(suf)]
+            break
+    return w[:6] if len(w) > 6 else w
+
+def resolve_root(token):
+    t = token.lower()
+    if t in _ROOT_SET:
+        return t
+    st = stem(t)
+    if st in _ROOT_SET:
+        return st
+    stripped = _strip_suffix(t)
+    if stripped in _ROOT_SET:
+        return stripped
+    if stem(stripped) in _ROOT_SET:
+        return stem(stripped)
+    for n in (6, 5, 4):
+        if len(st) >= n and st[:n] in _PREFIX_INDEX:
+            return _PREFIX_INDEX[st[:n]]
+        if len(stripped) >= n and stripped[:n] in _PREFIX_INDEX:
+            return _PREFIX_INDEX[stripped[:n]]
+    return st
+
+def expand_token(t):
+    out = {t, resolve_root(t)}
+    root = resolve_root(t)
+    for key, syns in SYNONYMS.items():
+        if t.startswith(key[:4]) or key.startswith(t[:4]) or root.startswith(key[:4]) or t in syns:
+            out.add(key)
+            out |= set(syns)
+            out.add(resolve_root(key))
+    return {x for x in out if x}
 
 def tokens(text):
-    return {w[:5] for w in words(text) if len(w) >= 3 and w not in STOP}
+    raw = [stem(w) for w in words(text) if len(w) >= 3 and w not in STOP]
+    expanded = set()
+    for t in raw:
+        expanded |= expand_token(t)
+    return expanded, set(raw)
+
+def char_ngrams(text, n=3):
+    s = re.sub(r"\s+", " ", text.lower().replace("ё", "е"))
+    s = re.sub(r"[^a-zа-я0-9 ]", "", s)
+    if len(s) < n:
+        return {s} if s else set()
+    return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+def extract_concepts(text):
+    _build_morph_index()
+    found = set()
+    ws = words(text)
+    joined = " ".join(ws)
+    compact = joined.replace(" ", "")
+    for w in ws:
+        st = stem(w)
+        root = resolve_root(w)
+        for key, gid in _CONCEPT_INDEX.items():
+            if len(key) < 3:
+                continue
+            if st == key or w == key or root == key:
+                found.add(gid)
+            elif len(key) >= 4 and (st.startswith(key) or (key.startswith(st) and len(st) >= 4)):
+                found.add(gid)
+            elif len(key) >= 4 and key in w:
+                found.add(gid)
+        if root in _ROOT_CONCEPT:
+            found.add(_ROOT_CONCEPT[root])
+        elif st in _ROOT_CONCEPT:
+            found.add(_ROOT_CONCEPT[st])
+    if any(x in compact for x in ("авто", "auto")) and any(x in compact for x in ("прыж", "jump")):
+        for key, gid in _CONCEPT_INDEX.items():
+            if key in ("прыж", "jump", "автопрыж"):
+                found.add(gid)
+    has_bg = any(x in compact for x in ("фон", "wallpaper", "обои", "фото", "картин", "image", "background", "кастом", "photo"))
+    has_screen = any(x in compact for x in ("экран", "screen", "меню", "gui", "главн", "интерф", "home"))
+    if has_bg and has_screen:
+        for key, gid in _CONCEPT_INDEX.items():
+            if key in ("фон", "background", "фото", "экран", "gui", "меню", "главн"):
+                found.add(gid)
+    return found
+
+def concept_similarity(ca, cb):
+    if not ca or not cb:
+        return 0.0
+    inter = ca & cb
+    if not inter:
+        return 0.0
+    def w(cid):
+        return 1.25 if cid < _MICRO_BASE else 0.3
+    w_inter = sum(w(i) for i in inter)
+    w_a = sum(w(i) for i in ca) or 1
+    w_b = sum(w(i) for i in cb) or 1
+    w_union = sum(w(i) for i in (ca | cb)) or 1
+    return 0.42 * (w_inter / w_union) + 0.58 * (w_inter / min(w_a, w_b))
+
+def key_phrases(text):
+    ws = [w for w in words(text) if len(w) >= 4 and w not in STOP]
+    bigrams = [f"{ws[i]}_{ws[i+1]}" for i in range(len(ws) - 1)]
+    trigrams = [f"{ws[i]}_{ws[i+1]}_{ws[i+2]}" for i in range(len(ws) - 2)]
+    return set(ws[:50]) | set(bigrams[:40]) | set(trigrams[:20])
+
+def action_object_pairs(text):
+    acts = {"добав","сдела","загруз","постав","установ","включ","убери","удал","измен","настро","созда","покаж","отобра","смен","выбер","upload","add","make","set","change","custom","встав","прикреп"}
+    objs = {"фон","фото","экран","прыж","карт","скин","звук","моб","босс","инвентар","меню","кнопк","лаг","fps","блок","руда","крафт","background","wallpaper","screen","jump","map","skin","обои","картин","image","photo","gui","hud"}
+    ws = words(text)
+    pairs = set()
+    for i, w in enumerate(ws):
+        st = stem(w)
+        if not any(st.startswith(a) or a in st for a in acts):
+            continue
+        for j in range(max(0, i - 2), min(len(ws), i + 5)):
+            if j == i:
+                continue
+            ot = stem(ws[j])
+            if any(ot.startswith(o) or o in ot for o in objs):
+                pairs.add((st[:4], ot[:4]))
+    return pairs
+
+def _sorted_bag(text):
+    """Слова без стоп-слов, отсортированные — порядок в предложении не важен."""
+    return sorted(w for w in words(text) if len(w) >= 3 and w not in STOP)
+
+
+def _root_bag(text):
+    """Мешок корней (порядок не важен)."""
+    return sorted(resolve_root(stem(w)) for w in words(text) if len(w) >= 3 and w not in STOP)
 
 
 def similarity(a, b):
-    ta, tb = tokens(a), tokens(b)
-    seq = SequenceMatcher(None, " ".join(words(a))[:500], " ".join(words(b))[:500]).ratio()
-    if not ta or not tb:
-        return seq * 0.6
-    inter = len(ta & tb)
-    jac = inter / len(ta | tb)
-    cont = inter / min(len(ta), len(tb))
-    cont *= min(1.0, min(len(ta), len(tb)) / 4)
-    return 0.45 * jac + 0.25 * cont + 0.30 * seq
+    """Похожесть по смыслу; устойчива к перестановке слов."""
+    if not a or not b:
+        return 0.0
 
+    ta_exp, ta_raw = tokens(a)
+    tb_exp, tb_raw = tokens(b)
+    ca, cb = extract_concepts(a), extract_concepts(b)
+    pa, pb = key_phrases(a), key_phrases(b)
+    nga, ngb = char_ngrams(a, 3), char_ngrams(b, 3)
+    aa, ab = action_object_pairs(a), action_object_pairs(b)
+    concept_score = concept_similarity(ca, cb)
 
-def find_similar(text, exclude_sid=None, limit=3, threshold=0.30):
+    # --- мешок слов / корней (полностью игнорирует порядок) ---
+    bag_a, bag_b = _sorted_bag(a), _sorted_bag(b)
+    root_a, root_b = _root_bag(a), _root_bag(b)
+    set_a, set_b = set(bag_a), set(bag_b)
+    rset_a, rset_b = set(root_a), set(root_b)
+
+    if set_a and set_b:
+        bag_jac = len(set_a & set_b) / len(set_a | set_b)
+        bag_cont = len(set_a & set_b) / min(len(set_a), len(set_b))
+    else:
+        bag_jac = bag_cont = 0.0
+
+    if rset_a and rset_b:
+        root_jac = len(rset_a & rset_b) / len(rset_a | rset_b)
+        root_cont = len(rset_a & rset_b) / min(len(rset_a), len(rset_b))
+    else:
+        root_jac = root_cont = 0.0
+
+    # сравнение отсортированных «канонических» фраз (одна и та же идея при перестановке)
+    canon_a = " ".join(bag_a)
+    canon_b = " ".join(bag_b)
+    canon_seq = SequenceMatcher(None, canon_a[:500], canon_b[:500]).ratio() if (canon_a and canon_b) else 0.0
+    root_canon = SequenceMatcher(
+        None, " ".join(root_a)[:500], " ".join(root_b)[:500]
+    ).ratio() if (root_a and root_b) else 0.0
+
+    if ta_exp and tb_exp:
+        inter_e = len(ta_exp & tb_exp)
+        jac_e = inter_e / len(ta_exp | tb_exp)
+        cont_e = inter_e / min(len(ta_exp), len(tb_exp))
+        inter_r = len(ta_raw & tb_raw)
+        jac_r = inter_r / (len(ta_raw | tb_raw) or 1) if (ta_raw or tb_raw) else 0.0
+        token_score = (
+            0.25 * jac_e + 0.15 * cont_e + 0.15 * jac_r
+            + 0.20 * root_jac + 0.15 * bag_jac + 0.10 * bag_cont
+        )
+        token_score *= min(1.0, (min(len(ta_raw), len(tb_raw)) or 1) / 2.0)
+    else:
+        token_score = 0.55 * root_jac + 0.45 * bag_jac
+
+    # исходный порядок — слабый сигнал (не должен ломать перестановки)
+    seq = SequenceMatcher(None, " ".join(words(a))[:700], " ".join(words(b))[:700]).ratio()
+    order_free_seq = max(canon_seq, root_canon)
+
+    # биграммы как множества пар (частично устойчивы к локальной перестановке)
+    phrase_score = min(1.0, (len(pa & pb) / (len(pa | pb) or 1)) * 1.55) if (pa and pb) else 0.0
+    ngram_score = (len(nga & ngb) / (len(nga | ngb) or 1)) if (nga and ngb) else 0.0
+
+    if aa and ab:
+        inter_a = len(aa & ab)
+        soft = 0.0
+        objs_a = {x[1] for x in aa}
+        objs_b = {x[1] for x in ab}
+        acts_a = {x[0] for x in aa}
+        acts_b = {x[0] for x in ab}
+        # объекты/действия как множества — порядок слов не важен
+        soft += 0.5 * (len(objs_a & objs_b) / (len(objs_a | objs_b) or 1))
+        soft += 0.35 * (len(acts_a & acts_b) / (len(acts_a | acts_b) or 1))
+        for x in aa:
+            for y in ab:
+                if x[1] == y[1]:
+                    soft += 0.25
+                elif x[0] == y[0]:
+                    soft += 0.1
+        action_score = min(1.0, inter_a * 0.7 + soft * 0.2)
+    else:
+        action_score = 0.0
+
+    score = (
+        0.28 * concept_score
+        + 0.24 * token_score
+        + 0.04 * seq                 # почти не смотрим на исходный порядок
+        + 0.12 * order_free_seq      # смотрим на отсортированный «канон»
+        + 0.10 * phrase_score
+        + 0.08 * ngram_score
+        + 0.14 * action_score
+    )
+
+    # если мешки корней сильно совпали — это та же суть при любой перестановке
+    if root_jac >= 0.55 or root_cont >= 0.7:
+        score = max(score, 0.58 + 0.35 * root_jac)
+    if bag_jac >= 0.55:
+        score = max(score, 0.55 + 0.35 * bag_jac)
+    if order_free_seq >= 0.75 and root_jac >= 0.4:
+        score = max(score, 0.72)
+
+    if concept_score >= 0.40 and (ca & cb):
+        score = max(score, 0.46 + 0.42 * concept_score)
+    if concept_score >= 0.55 and token_score >= 0.16:
+        score = max(score, 0.63)
+    if concept_score >= 0.72:
+        score = max(score, 0.74)
+    if concept_score >= 0.88:
+        score = max(score, 0.84)
+    if action_score >= 0.55 and concept_score >= 0.35:
+        score = max(score, 0.67)
+    if ngram_score >= 0.32 and token_score >= 0.22:
+        score = min(1.0, score + 0.04)
+
+    return max(0.0, min(1.0, score))
+
+def find_similar(text, exclude_sid=None, limit=3, threshold=0.22):
     res = []
     with db() as con:
         for r in con.execute("SELECT id, text, status FROM ideas"):
-            res.append(("idea", r["id"], similarity(text, r["text"]), r["text"], r["status"]))
-        for r in con.execute("SELECT id, text, status FROM suggestions WHERE status!='accepted' AND id!=?",
-                             (exclude_sid or 0,)):
-            res.append(("sug", r["id"], similarity(text, r["text"]), r["text"], r["status"]))
-    res = [x for x in res if x[2] >= threshold]
+            s = similarity(text, r["text"])
+            if s >= threshold:
+                res.append(("idea", r["id"], s, r["text"], r["status"]))
+        for r in con.execute(
+            "SELECT id, text, status FROM suggestions WHERE status!='accepted' AND id!=?",
+            (exclude_sid or 0,),
+        ):
+            s = similarity(text, r["text"])
+            if s >= threshold:
+                res.append(("sug", r["id"], s, r["text"], r["status"]))
     res.sort(key=lambda x: x[2], reverse=True)
     return res[:limit]
-
 
 def similar_block(similar):
     if not similar:
         return "🔍 Похожих идей в списке не найдено ✅"
     lines = ["🔍 <b>Похоже на уже добавленное:</b>"]
     for kind, _id, score, text, status in similar:
-        level = "🟠 очень похожа" if score >= 0.6 else ("🟡 похожа" if score >= 0.42 else "⚪ немного похожа")
+        pct = int(score * 100)
+        if score >= 0.70:
+            level = "🔴 почти то же самое"
+        elif score >= 0.55:
+            level = "🟠 очень похожа"
+        elif score >= 0.40:
+            level = "🟡 похожа"
+        elif score >= 0.20:
+            level = "⚪ немного похожа"
+        else:
+            level = "⚪ слабо похожа"
         if kind == "idea":
             label = f"Идея #{_id} ({status_info(status)[0]} {'в списке' if status in ('new', 'pending', 'chosen') else 'отклонена'})"
         else:
             label = f"Предложение #{_id} ({SUG_STATUS[status][1].lower()})"
-        lines.append(f"• <b>{label}</b> · {int(score * 100)}% · {level}\n   «{esc(short(text, 80))}»")
+        if pct < 20:
+            head = f"• <b>{label}</b> · {level}"
+        else:
+            head = f"• <b>{label}</b> · {pct}% · {level}"
+        lines.append(f"{head}\n   «{esc(short(text, 80))}»")
     return "\n".join(lines)
 
 
