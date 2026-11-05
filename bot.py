@@ -25,7 +25,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramFor
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup,
+    Message,
 )
 
 try:
@@ -73,10 +73,7 @@ SUG_STATUS = {
     "rejected": ("❌", "Отклонена"),
 }
 
-MENU_BTN = "🏠 Главное меню"
-REPLY_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=MENU_BTN)]], resize_keyboard=True, is_persistent=True
-)
+MENU_BTN = "🏠 Главное меню"  # старая кнопка: у кого она ещё висит, продолжит работать
 
 
 # ───────────────────────── база данных ─────────────────────────
@@ -139,6 +136,13 @@ def init_db():
             full_name TEXT,
             first_seen TEXT NOT NULL
         )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            added_by INTEGER,
+            added_at TEXT NOT NULL
+        )""")
         con.execute("""CREATE TABLE IF NOT EXISTS sessions (
             user_id INTEGER PRIMARY KEY,
             mode TEXT NOT NULL,
@@ -173,6 +177,18 @@ def init_db():
             created_at TEXT NOT NULL
         )""")
 
+
+# Описание, которое видно в пустом чате ещё до нажатия «Запустить» (до 512 символов)
+BOT_DESCRIPTION = (
+    "🎨 Decide Visuals\n\n"
+    "Бот клиента Decide Visuals.\n\n"
+    "⬇️ Скачай мод и лаунчер\n"
+    "💡 Предложи свою идею — она придёт напрямую создателю, а детали можно обсудить в чате\n"
+    "📚 Подай заявку на просмотр общего списка идей\n\n"
+    "Нажми «Запустить» 👇"
+)
+# Короткое описание: видно в профиле бота и при пересылке (до 120 символов)
+BOT_SHORT_DESCRIPTION = "Клиент Decide Visuals: скачать мод и лаунчер, предложить идею 🎨"
 
 # ───────────────────────── утилиты ─────────────────────────
 
@@ -314,7 +330,16 @@ def clear_session(uid):
 # ───────────────────────── доступ ─────────────────────────
 
 def is_admin(uid):
-    return uid in ADMIN_IDS
+    if uid in ADMIN_IDS:
+        return True
+    with db() as con:
+        return con.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone() is not None
+
+
+def all_admin_ids():
+    with db() as con:
+        extra = {r["user_id"] for r in con.execute("SELECT user_id FROM admins")}
+    return ADMIN_IDS | extra
 
 
 def access(uid):
@@ -679,8 +704,9 @@ def admin_counts():
 
 
 def screen_hub(user):
-    text = (f"⛏ <b>Minecraft Hub</b>\n\nПривет, {esc(user.first_name or user.full_name)}! 👋\n"
-            f"Выбери, что тебя интересует:")
+    text = (f"🎨 <b>Decide Visuals</b>\n\nПривет, {esc(user.first_name or user.full_name)}! 👋\n\n"
+            f"Здесь можно скачать клиент и предложить свою идею — она сразу придёт создателю.\n\n"
+            f"Выбери раздел:")
     rows = [[B("⬇️ Скачать клиент", "m:dl")], [B("💡 Идеи", "m:ideas")]]
     if is_admin(user.id):
         s, r, _ = admin_counts()
@@ -754,7 +780,7 @@ def screen_admin():
         [B(f"📥 Предложения · {s}" if s else "📥 Предложения", "adm:sug")],
         [B(f"👥 Заявки · {r}" if r else "👥 Заявки", "adm:req"), B(f"🧑‍💻 Участники · {m}", "adm:mem")],
         [B("🗂 Все идеи", "adm:all"), B("➕ Добавить идеи", "adm:add")],
-        [B("📊 Статистика", "adm:stat")],
+        [B("📊 Статистика", "adm:stat"), B("🛡 Админы", "adm:admins")],
         [B("⬅️ Назад", "m:home")],
     )
 
@@ -802,6 +828,23 @@ def screen_members():
     return "\n".join(lines), KB(*btns)
 
 
+def screen_admins():
+    with db() as con:
+        extra = con.execute("SELECT * FROM admins ORDER BY added_at").fetchall()
+        known = {r["user_id"]: r for r in con.execute("SELECT * FROM users")}
+    lines = ["🛡 <b>Администраторы</b>", "", "Полный доступ к боту — такой же, как у владельца.", ""]
+    for oid in sorted(ADMIN_IDS):
+        u = known.get(oid)
+        lines.append(f"👑 {user_link(oid, u['full_name'] if u else oid, u['username'] if u else None)} — владелец")
+    btns = []
+    for r in extra:
+        lines.append(f"🛡 {user_link(r['user_id'], r['full_name'], r['username'])}")
+        btns.append([B(f"🗑 Снять: {short(r['full_name'] or r['username'], 20)}", f"adm:rmadm:{r['user_id']}")])
+    btns.insert(0, [B("➕ Выдать полный доступ", "adm:addadm")])
+    btns.append([B("⬅️ Назад", "m:admin")])
+    return "\n".join(lines), KB(*btns)
+
+
 def screen_stats():
     c = counts_ideas()
     with db() as con:
@@ -831,7 +874,6 @@ def screen_stats():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     clear_session(message.from_user.id)
-    await message.answer("👋 Добро пожаловать! Кнопка «🏠 Главное меню» всегда под рукой.", reply_markup=REPLY_KB)
     text, kb = screen_hub(message.from_user)
     await message.answer(text, reply_markup=kb)
 
@@ -847,7 +889,7 @@ async def cmd_menu(message: Message):
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message):
     clear_session(message.from_user.id)
-    await message.answer("Ок, отменено.", reply_markup=REPLY_KB)
+    await message.answer("Ок, отменено.")
     text, kb = screen_hub(message.from_user)
     await message.answer(text, reply_markup=kb)
 
@@ -1009,7 +1051,7 @@ async def cb_request_access(call: CallbackQuery):
     text, kb = screen_ideas(u.id)
     await edit(call, text, kb)
     await ack(call, "Заявка отправлена создателю ✅", alert=True)
-    for aid in ADMIN_IDS:
+    for aid in all_admin_ids():
         try:
             await bot.send_message(
                 aid,
@@ -1131,7 +1173,7 @@ async def handle_new_idea(message: Message):
     body = esc_cut(text, 2500)[0]
     notice = (f"💡 <b>Новая идея #{sid}</b>\nот {user_link(u.id, u.full_name, u.username)}\n\n{body}\n\n"
               f"{similar_block(similar)}")
-    for aid in ADMIN_IDS:
+    for aid in all_admin_ids():
         try:
             await bot.send_message(aid, notice, reply_markup=sug_admin_kb(sug))
         except TelegramAPIError:
@@ -1148,7 +1190,7 @@ async def handle_user_chat(message: Message, sid):
     log_chat(sid, "user", msg_text(message))
     header = f"💬 <b>Идея #{sid}</b> · {user_link(u.id, u.full_name, u.username)}"
     sent = False
-    for aid in ADMIN_IDS:
+    for aid in all_admin_ids():
         try:
             await deliver(aid, header, message, KB([B("💬 Ответить", f"sug:chat:{sid}")]))
             sent = True
@@ -1459,6 +1501,7 @@ async def cb_admin(call: CallbackQuery):
     clear_session(uid)
     parts = call.data.split(":")
     section = parts[1]
+    toast = None
     if section == "sug":
         text, kb = screen_suggestions(len(parts) > 2 and parts[2] == "all")
     elif section == "req":
@@ -1467,6 +1510,52 @@ async def cb_admin(call: CallbackQuery):
         text, kb = screen_members()
     elif section == "stat":
         text, kb = screen_stats()
+    elif section == "admins":
+        text, kb = screen_admins()
+    elif section == "addadm":
+        set_session(uid, "add_admin")
+        text = ("➕ <b>Выдать полный доступ</b>\n\nОтправь @username человека.\n\n"
+                "<i>Человек должен хотя бы раз открыть бота и нажать «Запустить» — иначе я не смогу его найти.</i>")
+        kb = KB([B("❌ Отмена", "adm:admins")])
+    elif section == "addyes":
+        target = int(parts[2])
+        with db() as con:
+            u = con.execute("SELECT * FROM users WHERE user_id=?", (target,)).fetchone()
+        if not u:
+            toast = "Пользователь не найден"
+        elif is_admin(target):
+            toast = "Он уже администратор"
+        else:
+            with db() as con:
+                con.execute("INSERT OR REPLACE INTO admins(user_id,username,full_name,added_by,added_at) VALUES(?,?,?,?,?)",
+                            (target, u["username"], u["full_name"], uid, now()))
+            toast = "Доступ выдан ✅"
+            try:
+                await bot.send_message(
+                    target,
+                    "🛡 <b>Тебе выдан полный доступ администратора.</b>\n\nОткрой меню — там появилась «Админ-панель».",
+                    reply_markup=KB([B("🏠 Открыть меню", "m:home")]),
+                )
+            except TelegramAPIError:
+                pass
+        text, kb = screen_admins()
+    elif section == "rmadm":
+        target = int(parts[2])
+        if target in ADMIN_IDS:
+            toast = "Владельца нельзя снять"
+        elif target == uid:
+            toast = "Себя убрать нельзя"
+        else:
+            with db() as con:
+                removed = con.execute("DELETE FROM admins WHERE user_id=?", (target,)).rowcount
+            if removed:
+                clear_session(target)
+                toast = "Доступ снят"
+                try:
+                    await bot.send_message(target, "Доступ администратора снят.")
+                except TelegramAPIError:
+                    pass
+        text, kb = screen_admins()
     elif section == "add":
         set_session(uid, "upload_ideas")
         text = ("➕ <b>Добавить идеи</b>\n\nОтправь идеи текстом или TXT-файлом (UTF-8).\n\n"
@@ -1495,7 +1584,7 @@ async def cb_admin(call: CallbackQuery):
         await ack(call)
         return
     await edit(call, text, kb)
-    await ack(call)
+    await ack(call, toast)
 
 
 async def preview_upload(message: Message, raw):
@@ -1576,6 +1665,33 @@ async def cb_upload_ideas_confirm(call: CallbackQuery):
     await ack(call, "Готово")
 
 
+async def handle_add_admin(message: Message):
+    raw = (message.text or "").strip()
+    raw = re.sub(r"^(?:https?://)?t\.me/", "", raw).lstrip("@").strip()
+    cancel = KB([B("❌ Отмена", "adm:admins")])
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw):
+        await message.answer("Пришли юзернейм в формате <code>@username</code>.", reply_markup=cancel)
+        return
+    with db() as con:
+        u = con.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (raw,)).fetchone()
+    if not u:
+        await message.answer(
+            f"Не нашёл @{esc(raw)} среди пользователей бота.\n\n"
+            "Пусть человек откроет бота и нажмёт «Запустить», затем отправь юзернейм снова.",
+            reply_markup=cancel,
+        )
+        return
+    if is_admin(u["user_id"]):
+        clear_session(message.from_user.id)
+        await message.answer("Этот человек уже администратор.", reply_markup=KB([B("🛡 К списку админов", "adm:admins")]))
+        return
+    clear_session(message.from_user.id)
+    await message.answer(
+        f"Выдать <b>полный доступ</b> администратора?\n\n{user_link(u['user_id'], u['full_name'], u['username'])}",
+        reply_markup=KB([B("✅ Выдать доступ", f"adm:addyes:{u['user_id']}")], [B("❌ Отмена", "adm:admins")]),
+    )
+
+
 async def handle_edit_idea(message: Message, iid):
     text = (message.text or "").strip()
     if not text:
@@ -1600,7 +1716,7 @@ async def on_message(message: Message):
         await message.answer(text, reply_markup=kb)
         return
     mode, ref = sess["mode"], sess["ref"]
-    admin_modes = {"admin_chat", "upload_ideas", "upload_mod", "upload_launcher", "edit_idea"}
+    admin_modes = {"admin_chat", "upload_ideas", "upload_mod", "upload_launcher", "edit_idea", "add_admin"}
     if mode in admin_modes and not is_admin(uid):
         clear_session(uid)
         return
@@ -1616,6 +1732,8 @@ async def on_message(message: Message):
         await handle_upload_file(message, mode.split("_", 1)[1])
     elif mode == "edit_idea":
         await handle_edit_idea(message, ref)
+    elif mode == "add_admin":
+        await handle_add_admin(message)
     elif mode in ("file_confirm", "ideas_confirm"):
         await message.answer("Подтверди или отмени действие кнопками выше 👆")
     else:
@@ -1658,6 +1776,11 @@ async def main():
         BotCommand(command="cancel", description="Отменить текущее действие"),
         BotCommand(command="id", description="Узнать свой Telegram ID"),
     ])
+    try:
+        await bot.set_my_description(description=BOT_DESCRIPTION)
+        await bot.set_my_short_description(short_description=BOT_SHORT_DESCRIPTION)
+    except TelegramAPIError:
+        logging.exception("Не удалось задать описание бота")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
