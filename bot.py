@@ -1,0 +1,1665 @@
+import subprocess
+import sys
+
+try:  # если библиотек нет — бот сам их установит при первом запуске
+    from aiogram.client.default import DefaultBotProperties  # noqa: F401  (нужен aiogram >= 3.7)
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "aiogram>=3.7"])
+
+import asyncio
+import html
+import json
+import logging
+import os
+import re
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from io import BytesIO
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, Message, ReplyKeyboardMarkup,
+)
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
+
+logging.basicConfig(level=logging.INFO)
+
+# ═══════════ НАСТРОЙКИ ═══════════
+# Вставь сюда токен бота от @BotFather и свой Telegram ID (узнать: команда /id в боте
+# или @userinfobot). Несколько админов — через запятую: "111,222".
+# Можно вместо этого задать переменные окружения BOT_TOKEN и ADMIN_IDS.
+BOT_TOKEN = ""
+ADMIN_IDS_TEXT = ""
+# ═════════════════════════════════
+
+load_dotenv()
+TOKEN = (os.getenv("BOT_TOKEN") or BOT_TOKEN).strip()
+ADMIN_IDS = {int(x.strip()) for x in (os.getenv("ADMIN_IDS") or ADMIN_IDS_TEXT).split(",") if x.strip()}
+DB_PATH = os.getenv("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ideas.sqlite3")
+
+if not TOKEN:
+    raise RuntimeError("Впиши BOT_TOKEN в начале файла bot.py (раздел НАСТРОЙКИ)")
+if not ADMIN_IDS:
+    raise RuntimeError("Впиши свой Telegram ID в ADMIN_IDS_TEXT в начале файла bot.py")
+
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
+dp = Dispatcher()
+dp.message.filter(F.chat.type == "private")
+
+# ───────────────────────── константы ─────────────────────────
+
+KINDS = {
+    "mod": ("📦", "Мод", "мода"),
+    "launcher": ("🚀", "Лаунчер", "лаунчера"),
+}
+
+FILTERS = {"all": None, "free": ("new",), "taken": ("pending", "chosen")}
+
+SUG_STATUS = {
+    "open": ("🕓", "На рассмотрении"),
+    "accepted": ("✅", "Принята в список"),
+    "rejected": ("❌", "Отклонена"),
+}
+
+MENU_BTN = "🏠 Главное меню"
+REPLY_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=MENU_BTN)]], resize_keyboard=True, is_persistent=True
+)
+
+
+# ───────────────────────── база данных ─────────────────────────
+
+@contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def add_columns(con, table, cols):
+    have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in cols.items():
+        if name not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def init_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS ideas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',
+            created_at TEXT NOT NULL,
+            created_by INTEGER NOT NULL
+        )""")
+        add_columns(con, "ideas", {
+            "status_by": "INTEGER", "status_by_name": "TEXT",
+            "status_at": "TEXT", "source_suggestion": "INTEGER",
+        })
+        con.execute("""CREATE TABLE IF NOT EXISTS actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idea_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS requests (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            first_seen TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            user_id INTEGER PRIMARY KEY,
+            mode TEXT NOT NULL,
+            ref INTEGER,
+            data TEXT
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS files (
+            kind TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            file_unique_id TEXT,
+            file_name TEXT,
+            file_size INTEGER,
+            caption TEXT,
+            uploaded_at TEXT NOT NULL,
+            uploaded_by INTEGER
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            full_name TEXT,
+            text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            idea_id INTEGER,
+            created_at TEXT NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS sug_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suggestion_id INTEGER NOT NULL,
+            sender TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+
+
+# ───────────────────────── утилиты ─────────────────────────
+
+def esc(s):
+    return html.escape(str(s or ""), quote=False)
+
+
+def esc_cut(raw, limit):
+    """Экранирует текст и обрезает так, чтобы результат не превышал limit. -> (текст, обрезан?)"""
+    e = esc(raw)
+    if len(e) <= limit:
+        return e, False
+    cut = min(len(raw), limit)
+    while cut > 0 and len(esc(raw[:cut])) > limit - 1:
+        cut = int(cut * 0.85)
+    return esc(raw[:cut]).rstrip() + "…", True
+
+
+def esc_pieces(raw, limit=3500):
+    """Разбивает сырой текст на экранированные строки, каждая не длиннее limit."""
+    pieces = []
+    for line in raw.split("\n"):
+        e = esc(line)
+        if len(e) <= limit:
+            pieces.append(e)
+        else:
+            step = max(100, limit // 6)
+            for i in range(0, len(line), step):
+                pieces.append(esc(line[i:i + step]))
+    return pieces or [""]
+
+
+def pack(lines, limit=3900):
+    """Склеивает строки в сообщения, не превышая лимит Telegram."""
+    out, cur = [], ""
+    for line in lines:
+        candidate = line if not cur else cur + "\n" + line
+        if len(candidate) > limit and cur:
+            out.append(cur)
+            cur = line
+        else:
+            cur = candidate
+    if cur:
+        out.append(cur)
+    return out
+
+
+def short(text, n=60):
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def fmt_date(iso):
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%d.%m.%Y")
+    except Exception:
+        return "—"
+
+
+def fmt_dt(iso):
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%d.%m %H:%M")
+    except Exception:
+        return ""
+
+
+def fmt_size(n):
+    n = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{int(n)} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def user_link(uid, name, username=None):
+    s = f'<a href="tg://user?id={uid}">{esc(name or uid)}</a>'
+    if username:
+        s += f" (@{esc(username)})"
+    return s
+
+
+def B(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def KB(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
+
+
+async def ack(call, text=None, alert=False):
+    try:
+        await call.answer(text, show_alert=alert)
+    except TelegramAPIError:
+        pass
+
+
+async def edit(call, text, markup=None):
+    try:
+        await call.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        try:
+            await call.message.answer(text, reply_markup=markup)
+        except TelegramAPIError:
+            logging.exception("Не удалось отправить сообщение")
+
+
+async def present(target, text, markup=None):
+    if isinstance(target, CallbackQuery):
+        await edit(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+# ───────────────────────── сессии (режимы ввода) ─────────────────────────
+
+def set_session(uid, mode, ref=None, data=None):
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO sessions(user_id,mode,ref,data) VALUES(?,?,?,?)",
+            (uid, mode, ref, json.dumps(data, ensure_ascii=False) if data is not None else None),
+        )
+
+
+def get_session(uid):
+    with db() as con:
+        row = con.execute("SELECT * FROM sessions WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        return None
+    return {"mode": row["mode"], "ref": row["ref"], "data": json.loads(row["data"]) if row["data"] else None}
+
+
+def clear_session(uid):
+    with db() as con:
+        con.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+
+
+# ───────────────────────── доступ ─────────────────────────
+
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
+
+def access(uid):
+    if is_admin(uid):
+        return "approved"
+    with db() as con:
+        row = con.execute("SELECT status FROM requests WHERE user_id=?", (uid,)).fetchone()
+    return row["status"] if row else None
+
+
+async def need_access(call):
+    if access(call.from_user.id) != "approved":
+        await ack(call, "Нет доступа. Подай заявку в разделе «Идеи».", alert=True)
+        return False
+    return True
+
+
+async def need_admin(call):
+    if not is_admin(call.from_user.id):
+        await ack(call, "Только для администратора", alert=True)
+        return False
+    return True
+
+
+# ───────────────────────── файлы клиента ─────────────────────────
+
+def get_file(kind):
+    with db() as con:
+        return con.execute("SELECT * FROM files WHERE kind=?", (kind,)).fetchone()
+
+
+def save_file(kind, info, uid):
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO files(kind,file_id,file_unique_id,file_name,file_size,caption,uploaded_at,uploaded_by)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (kind, info["file_id"], info["unique"], info["name"], info["size"], info["caption"], now(), uid),
+        )
+
+
+# ───────────────────────── идеи ─────────────────────────
+
+def status_info(status):
+    return {
+        "new": ("🟢", "Никто не трогал"),
+        "pending": ("🟢", "Выбрана, ожидает получения списка"),
+        "chosen": ("🟡", "Выбрана и зафиксирована через «Получить список»"),
+        "declined": ("🔴", "От идеи отказались"),
+    }[status]
+
+
+def idea_ids(f):
+    st = FILTERS.get(f)
+    q, params = "SELECT id FROM ideas", []
+    if st:
+        q += " WHERE status IN (%s)" % ",".join("?" * len(st))
+        params = list(st)
+    with db() as con:
+        return [r["id"] for r in con.execute(q + " ORDER BY id", params)]
+
+
+def get_idea(idea_id):
+    with db() as con:
+        return con.execute("SELECT * FROM ideas WHERE id=?", (idea_id,)).fetchone()
+
+
+def resolve_idea(f, idea_id, exact):
+    if exact and idea_id:
+        idea = get_idea(idea_id)
+        if idea:
+            return idea
+    ids = idea_ids(f)
+    if not ids:
+        return None
+    if idea_id in ids:
+        target = idea_id
+    else:
+        bigger = [i for i in ids if i > idea_id]
+        target = bigger[0] if bigger else ids[-1]
+        if not idea_id:
+            target = ids[0]
+    return get_idea(target)
+
+
+def counts_ideas():
+    with db() as con:
+        return {r["status"]: r["n"] for r in con.execute("SELECT status, COUNT(*) n FROM ideas GROUP BY status")}
+
+
+def set_status(idea_id, status, user):
+    by = user.id if status != "new" else None
+    name = user.full_name if status != "new" else None
+    with db() as con:
+        con.execute(
+            "UPDATE ideas SET status=?, status_by=?, status_by_name=?, status_at=? WHERE id=?",
+            (status, by, name, now(), idea_id),
+        )
+        action = {"pending": "selected", "declined": "declined", "new": "returned"}.get(status, status)
+        con.execute("INSERT INTO actions(idea_id,user_id,action,created_at) VALUES(?,?,?,?)",
+                    (idea_id, user.id, action, now()))
+
+
+def filter_row(f, idea_id):
+    labels = {"all": "Все", "free": "🟢 Свободные", "taken": "🟡 Взятые"}
+    return [B(("✔ " if k == f else "") + v, f"vf:{k}:{idea_id}") for k, v in labels.items()]
+
+
+def build_card(idea, f, admin):
+    iid = idea["id"]
+    ids = idea_ids(f)
+    if iid in ids:
+        where = f"{ids.index(iid) + 1} из {len(ids)}"
+    else:
+        where = "вне фильтра"
+    smaller = [i for i in ids if i < iid]
+    larger = [i for i in ids if i > iid]
+    prev_id = smaller[-1] if smaller else (ids[-1] if ids and ids[-1] != iid else None)
+    next_id = larger[0] if larger else (ids[0] if ids and ids[0] != iid else None)
+
+    emoji, label = status_info(idea["status"])
+    who = ""
+    if idea["status_by_name"] and idea["status"] != "new":
+        verb = "Отказ" if idea["status"] == "declined" else "Взял(а)"
+        who = f"\n👤 {verb}: <b>{esc(idea['status_by_name'])}</b>"
+    body, cut = esc_cut(idea["text"], 2800)
+    c = counts_ideas()
+    taken = c.get("pending", 0) + c.get("chosen", 0)
+    total = sum(c.values())
+    text = (
+        f"💡 <b>Идея #{iid}</b> · {where}\n\n{body}\n\n"
+        f"{emoji} <b>{esc(label)}</b>{who}\n\n"
+        f"<i>📊 Всего {total} · свободно {c.get('new', 0)} · взято {taken} · отказ {c.get('declined', 0)}</i>"
+    )
+
+    st = idea["status"]
+    if st == "new":
+        actions = [B("🟢 Добавить в список", f"pick:{f}:{iid}"), B("🔴 Отказаться", f"decl:{f}:{iid}")]
+    elif st == "pending":
+        actions = [B("↩️ Вернуть в список", f"ret:{f}:{iid}"), B("🔴 Отказаться", f"decl:{f}:{iid}")]
+    else:
+        actions = [B("↩️ Вернуть в список", f"ret:{f}:{iid}")]
+
+    rows = [
+        [B("⬅️", f"i:{f}:{prev_id}" if prev_id else "noop"),
+         B(where if iid in ids else "·", "noop"),
+         B("➡️", f"i:{f}:{next_id}" if next_id else "noop")],
+        actions,
+    ]
+    if cut:
+        rows.append([B("📄 Показать полностью", f"full:{iid}")])
+    rows.append(filter_row(f, iid))
+    rows.append([B("📋 Получить список", f"rpt:{f}:{iid}")])
+    if admin:
+        rows.append([B("✏️ Изменить", f"edit:{iid}"), B("🗑 Удалить", f"del:{f}:{iid}")])
+    rows.append([B("⬅️ В меню идей", "m:ideas")])
+    return text, KB(*rows)
+
+
+async def show_idea(target, f="all", idea_id=0, exact=True):
+    idea = resolve_idea(f, idea_id, exact)
+    if not idea:
+        await present(
+            target,
+            "📭 <b>Здесь пока пусто</b>\n\nИдей с таким фильтром нет.",
+            KB(filter_row(f, 0), [B("⬅️ В меню идей", "m:ideas")]),
+        )
+        return
+    text, kb = build_card(idea, f, is_admin(target.from_user.id))
+    await present(target, text, kb)
+
+
+def parse_fi(data):
+    _, f, i = data.split(":")
+    return (f if f in FILTERS else "all"), int(i)
+
+
+def parse_ideas(raw):
+    """Нумерованные строки начинают новые идеи; можно также разделять строкой ---."""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    lines = raw.split("\n")
+    num = re.compile(r"^\s*\d+[.)]\s+")
+    has_numbers = any(num.match(line) for line in lines)
+    has_sep = any(line.strip() == "---" for line in lines)
+    chunks, current, started = [], [], False
+    for line in lines:
+        if line.strip() == "---":
+            if "\n".join(current).strip():
+                chunks.append("\n".join(current).strip())
+            current, started = [], True
+        elif has_numbers and num.match(line):
+            if "\n".join(current).strip():
+                chunks.append("\n".join(current).strip())
+            current, started = [num.sub("", line).strip()], True
+        elif has_numbers and not has_sep and not started:
+            continue  # вступление перед первым пунктом
+        else:
+            current.append(line)
+    if "\n".join(current).strip():
+        chunks.append("\n".join(current).strip())
+
+    result, seen = [], set()
+    for item in chunks:
+        item = re.sub(r"\n{3,}", "\n\n", item).strip()
+        key = norm_key(item)
+        if item and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def norm_key(text):
+    return re.sub(r"\s+", " ", text).casefold()
+
+
+# ───────────────────────── поиск похожих идей ─────────────────────────
+
+STOP = set("""и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по только ее мне
+было вот от меня еще нет о из ему теперь когда даже ну вдруг ли если уже или ни быть был него до вас нибудь
+опять уж вам ведь там потом себя ничего ей может они тут где есть надо ней для мы тебя их чем была сам чтоб
+без будто чего раз тоже себе под будет ж тогда кто этот того потому этого какой совсем ним здесь этом один
+почти мой тем чтобы нее сейчас были куда зачем всех никогда можно при наконец два об другой хоть после над
+больше тот через эти нас про всего них какая много разве три эту моя впрочем хорошо свою этой перед иногда
+лучше чуть том нельзя такой им более всегда конечно всю между это хотел добавить сделать игре игра игры
+майнкрафт майн minecraft мод нужно хочу было будут чтобы очень также еще""".split())
+
+
+def words(text):
+    return re.findall(r"[a-zа-я0-9]+", text.lower().replace("ё", "е"))
+
+
+def tokens(text):
+    return {w[:5] for w in words(text) if len(w) >= 3 and w not in STOP}
+
+
+def similarity(a, b):
+    ta, tb = tokens(a), tokens(b)
+    seq = SequenceMatcher(None, " ".join(words(a))[:500], " ".join(words(b))[:500]).ratio()
+    if not ta or not tb:
+        return seq * 0.6
+    inter = len(ta & tb)
+    jac = inter / len(ta | tb)
+    cont = inter / min(len(ta), len(tb))
+    cont *= min(1.0, min(len(ta), len(tb)) / 4)
+    return 0.45 * jac + 0.25 * cont + 0.30 * seq
+
+
+def find_similar(text, exclude_sid=None, limit=3, threshold=0.30):
+    res = []
+    with db() as con:
+        for r in con.execute("SELECT id, text, status FROM ideas"):
+            res.append(("idea", r["id"], similarity(text, r["text"]), r["text"], r["status"]))
+        for r in con.execute("SELECT id, text, status FROM suggestions WHERE status!='accepted' AND id!=?",
+                             (exclude_sid or 0,)):
+            res.append(("sug", r["id"], similarity(text, r["text"]), r["text"], r["status"]))
+    res = [x for x in res if x[2] >= threshold]
+    res.sort(key=lambda x: x[2], reverse=True)
+    return res[:limit]
+
+
+def similar_block(similar):
+    if not similar:
+        return "🔍 Похожих идей в списке не найдено ✅"
+    lines = ["🔍 <b>Похоже на уже добавленное:</b>"]
+    for kind, _id, score, text, status in similar:
+        level = "🟠 очень похожа" if score >= 0.6 else ("🟡 похожа" if score >= 0.42 else "⚪ немного похожа")
+        if kind == "idea":
+            label = f"Идея #{_id} ({status_info(status)[0]} {'в списке' if status in ('new', 'pending', 'chosen') else 'отклонена'})"
+        else:
+            label = f"Предложение #{_id} ({SUG_STATUS[status][1].lower()})"
+        lines.append(f"• <b>{label}</b> · {int(score * 100)}% · {level}\n   «{esc(short(text, 80))}»")
+    return "\n".join(lines)
+
+
+# ───────────────────────── предложения и чаты ─────────────────────────
+
+def get_suggestion(sid):
+    with db() as con:
+        return con.execute("SELECT * FROM suggestions WHERE id=?", (sid,)).fetchone()
+
+
+def log_chat(sid, sender, text):
+    with db() as con:
+        con.execute("INSERT INTO sug_messages(suggestion_id,sender,text,created_at) VALUES(?,?,?,?)",
+                    (sid, sender, text, now()))
+
+
+def msg_text(message):
+    return (message.text or message.caption or f"[{getattr(message.content_type, 'value', message.content_type)}]")[:4000]
+
+
+def history_text(sid, admin, name=""):
+    with db() as con:
+        rows = con.execute("SELECT * FROM sug_messages WHERE suggestion_id=? ORDER BY id DESC LIMIT 12", (sid,)).fetchall()
+    blocks, used, hidden = [], 0, False
+    for r in rows:
+        if r["sender"] == "user":
+            who = f"🧑 <b>{esc(short(name, 20))}</b>" if admin else "🧑 <b>Вы</b>"
+        else:
+            who = "🤖 <b>Вы (от имени бота)</b>" if admin else "👑 <b>Создатель</b>"
+        body = esc_cut(r["text"], 700)[0]
+        block = f"{who} · <i>{fmt_dt(r['created_at'])}</i>\n{body}"
+        if used + len(block) > 2800 and blocks:
+            hidden = True
+            break
+        blocks.append(block)
+        used += len(block) + 2
+    text = "\n\n".join(reversed(blocks)) or "<i>Сообщений пока нет</i>"
+    return ("<i>… ранние сообщения скрыты</i>\n\n" + text) if hidden or len(rows) == 12 else text
+
+
+def sug_admin_kb(sug, in_chat=False):
+    sid, st = sug["id"], sug["status"]
+    rows = []
+    if not in_chat:
+        rows.append([B("💬 Открыть чат", f"sug:chat:{sid}")])
+    if st == "open":
+        rows.append([B("✅ В список идей", f"sug:acc:{sid}"), B("❌ Отклонить", f"sug:rej:{sid}")])
+    elif st == "accepted":
+        rows.append([B(f"✅ Принята · идея #{sug['idea_id']}", "noop")])
+    else:
+        rows.append([B("❌ Отклонена", "noop"), B("✅ Всё же принять", f"sug:acc:{sid}")])
+    if in_chat:
+        rows.append([B("🚪 Выйти из чата", "sug:exit"), B("⬅️ К предложениям", "adm:sug")])
+    return KB(*rows)
+
+
+def chat_view(sug, admin):
+    emoji, label = SUG_STATUS[sug["status"]]
+    head = f"💬 <b>Чат по идее #{sug['id']}</b> · {emoji} {label}"
+    if admin:
+        head += f"\n👤 {user_link(sug['user_id'], sug['full_name'], sug['username'])}"
+    hist = history_text(sug["id"], admin, sug["full_name"])
+    if admin:
+        foot = "✍️ <i>Пиши сообщение — оно уйдёт автору от имени бота.</i>"
+        kb = sug_admin_kb(sug, in_chat=True)
+    else:
+        foot = "✍️ <i>Пиши дополнения или вопросы — я передам их создателю, а его ответы придут сюда.</i>"
+        kb = KB([B("🚪 Выйти из чата", "sug:exit")], [B("⬅️ К моим идеям", "idea:mine")])
+    return f"{head}\n\n{hist}\n\n{foot}", kb
+
+
+async def deliver(chat_id, header, message, markup=None):
+    """Отправляет текст с заголовком или заголовок + копию вложения."""
+    if message.text:
+        body = esc_cut(message.text, 3700)[0]
+        await bot.send_message(chat_id, f"{header}\n\n{body}", reply_markup=markup)
+    else:
+        await bot.send_message(chat_id, header, reply_markup=markup)
+        await bot.copy_message(chat_id, message.chat.id, message.message_id)
+
+
+# ───────────────────────── экраны ─────────────────────────
+
+def admin_counts():
+    with db() as con:
+        s = con.execute("SELECT COUNT(*) n FROM suggestions WHERE status='open'").fetchone()["n"]
+        r = con.execute("SELECT COUNT(*) n FROM requests WHERE status='pending'").fetchone()["n"]
+        m = con.execute("SELECT COUNT(*) n FROM requests WHERE status='approved'").fetchone()["n"]
+    return s, r, m
+
+
+def screen_hub(user):
+    text = (f"⛏ <b>Minecraft Hub</b>\n\nПривет, {esc(user.first_name or user.full_name)}! 👋\n"
+            f"Выбери, что тебя интересует:")
+    rows = [[B("⬇️ Скачать клиент", "m:dl")], [B("💡 Идеи", "m:ideas")]]
+    if is_admin(user.id):
+        s, r, _ = admin_counts()
+        badge = f" · {s + r}" if s + r else ""
+        rows.append([B(f"🛠 Админ-панель{badge}", "m:admin")])
+    return text, KB(*rows)
+
+
+def screen_downloads(uid):
+    lines = ["⬇️ <b>Скачать клиент</b>", ""]
+    for kind, (emoji, title, _) in KINDS.items():
+        f = get_file(kind)
+        if f:
+            lines.append(f"{emoji} <b>{title}</b>\n└ {esc(f['file_name'])} · {fmt_size(f['file_size'])} · от {fmt_date(f['uploaded_at'])}")
+            if f["caption"]:
+                lines.append(f"└ 📝 {esc_cut(f['caption'], 300)[0]}")
+        else:
+            lines.append(f"{emoji} <b>{title}</b>\n└ <i>пока не загружен</i>")
+        lines.append("")
+    lines.append("Выбери, что скачать 👇")
+    rows = [[B("📦 Скачать мод", "dl:mod"), B("🚀 Скачать лаунчер", "dl:launcher")]]
+    if is_admin(uid):
+        rows.append([B("⬆️ Загрузить мод", "up:mod")])
+        rows.append([B("⬆️ Загрузить лаунчер", "up:launcher")])
+    rows.append([B("⬅️ Назад", "m:home")])
+    return "\n".join(lines), KB(*rows)
+
+
+def screen_ideas(uid):
+    st = access(uid)
+    with db() as con:
+        n = con.execute("SELECT COUNT(*) n FROM suggestions WHERE user_id=?", (uid,)).fetchone()["n"]
+    text = ("💡 <b>Идеи</b>\n\nПредложи свою идею для проекта — она сразу уйдёт создателю, "
+            "а обсудить её можно будет прямо здесь, в чате.")
+    if st == "approved":
+        text += "\n\n📚 У тебя есть доступ к общему списку идей."
+        access_btn = B("📚 Открыть идеи", "v:open")
+    elif st == "pending":
+        text += "\n\n⏳ Заявка на просмотр идей на рассмотрении."
+        access_btn = B("⏳ Заявка на рассмотрении", "noop:pending")
+    elif st == "rejected":
+        text += "\n\n⚠️ Прошлая заявка на просмотр идей отклонена — можно подать новую."
+        access_btn = B("🔑 Подать заявку снова", "acc:req")
+    else:
+        text += "\n\n🔒 Общий список идей открывается по заявке — её рассматривает создатель."
+        access_btn = B("🔑 Заявка на просмотр идей", "acc:req")
+    rows = [[B("✍️ Предложить идею", "idea:suggest")]]
+    if n:
+        rows.append([B(f"📂 Мои идеи ({n})", "idea:mine")])
+    rows.append([access_btn])
+    rows.append([B("⬅️ Назад", "m:home")])
+    return text, KB(*rows)
+
+
+def screen_my_ideas(uid):
+    with db() as con:
+        rows = con.execute("SELECT * FROM suggestions WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,)).fetchall()
+    text = "📂 <b>Мои идеи</b>\n\nВыбери идею, чтобы открыть её чат — там можно дополнить её или задать вопрос."
+    if not rows:
+        text = "📂 <b>Мои идеи</b>\n\nТы пока ничего не предлагал(а)."
+    btns = [[B(f"{SUG_STATUS[r['status']][0]} #{r['id']} · {short(r['text'], 30)}", f"my:open:{r['id']}")] for r in rows]
+    btns.append([B("✍️ Предложить ещё", "idea:suggest")])
+    btns.append([B("⬅️ Назад", "m:ideas")])
+    return text, KB(*btns)
+
+
+def screen_admin():
+    s, r, m = admin_counts()
+    text = "🛠 <b>Админ-панель</b>\n\nВыбери раздел:"
+    return text, KB(
+        [B(f"📥 Предложения · {s}" if s else "📥 Предложения", "adm:sug")],
+        [B(f"👥 Заявки · {r}" if r else "👥 Заявки", "adm:req"), B(f"🧑‍💻 Участники · {m}", "adm:mem")],
+        [B("🗂 Все идеи", "adm:all"), B("➕ Добавить идеи", "adm:add")],
+        [B("📊 Статистика", "adm:stat")],
+        [B("⬅️ Назад", "m:home")],
+    )
+
+
+def screen_suggestions(show_all):
+    with db() as con:
+        q = "SELECT * FROM suggestions" + ("" if show_all else " WHERE status='open'") + " ORDER BY id DESC LIMIT 20"
+        rows = con.execute(q).fetchall()
+    if show_all:
+        text = "📥 <b>Все предложения</b> (последние 20)"
+    else:
+        text = f"📥 <b>Предложения на рассмотрении</b>: {len(rows)}" if rows else "📥 <b>Предложения</b>\n\nНовых предложений нет 🎉"
+    btns = [[B(f"{SUG_STATUS[r['status']][0]} #{r['id']} · {short(r['full_name'], 12)} · {short(r['text'], 24)}",
+               f"sug:open:{r['id']}")] for r in rows]
+    btns.append([B("🕓 Только новые" if show_all else "🗄 Показать все", "adm:sug" if show_all else "adm:sug:all")])
+    btns.append([B("⬅️ Назад", "m:admin")])
+    return text, KB(*btns)
+
+
+def screen_requests():
+    with db() as con:
+        rows = con.execute("SELECT * FROM requests WHERE status='pending' ORDER BY created_at").fetchall()
+    if not rows:
+        return "👥 <b>Заявки на просмотр идей</b>\n\nНовых заявок нет.", KB([B("⬅️ Назад", "m:admin")])
+    lines = [f"👥 <b>Заявки на просмотр идей</b>: {len(rows)}", ""]
+    btns = []
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. {user_link(r['user_id'], r['full_name'], r['username'])}")
+        btns.append([B(f"✅ {short(r['full_name'], 16)}", f"rq:yes:{r['user_id']}"), B("❌ Отклонить", f"rq:no:{r['user_id']}")])
+    btns.append([B("⬅️ Назад", "m:admin")])
+    return "\n".join(lines), KB(*btns)
+
+
+def screen_members():
+    with db() as con:
+        rows = con.execute("SELECT * FROM requests WHERE status='approved' ORDER BY created_at").fetchall()
+    if not rows:
+        return "🧑‍💻 <b>Участники</b>\n\nУчастников с доступом пока нет.", KB([B("⬅️ Назад", "m:admin")])
+    lines = [f"🧑‍💻 <b>Участники с доступом</b>: {len(rows)}", ""]
+    btns = []
+    for r in rows:
+        lines.append(f"• {user_link(r['user_id'], r['full_name'], r['username'])}")
+        btns.append([B(f"🚫 Отозвать: {short(r['full_name'], 20)}", f"rq:revoke:{r['user_id']}")])
+    btns.append([B("⬅️ Назад", "m:admin")])
+    return "\n".join(lines), KB(*btns)
+
+
+def screen_stats():
+    c = counts_ideas()
+    with db() as con:
+        total_users = con.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        sug_open = con.execute("SELECT COUNT(*) n FROM suggestions WHERE status='open'").fetchone()["n"]
+        sug_all = con.execute("SELECT COUNT(*) n FROM suggestions").fetchone()["n"]
+        logs = con.execute("SELECT COUNT(*) n FROM actions").fetchone()["n"]
+    s, r, m = admin_counts()
+    files = " · ".join(f"{KINDS[k][1]} {'✅' if get_file(k) else '—'}" for k in KINDS)
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"💡 <b>Идеи</b>: всего {sum(c.values())}\n"
+        f"🟢 Не трогали: {c.get('new', 0)}\n"
+        f"🟢 Выбраны, ждут списка: {c.get('pending', 0)}\n"
+        f"🟡 Зафиксированы отчётом: {c.get('chosen', 0)}\n"
+        f"🔴 Отклонены: {c.get('declined', 0)}\n\n"
+        f"📥 <b>Предложения</b>: на рассмотрении {sug_open} из {sug_all}\n"
+        f"👥 <b>Люди</b>: пользователей {total_users} · с доступом {m} · заявок {r}\n"
+        f"📦 <b>Файлы</b>: {files}\n"
+        f"🧾 Записей истории: {logs}"
+    )
+    return text, KB([B("⬅️ Назад", "m:admin")])
+
+
+# ───────────────────────── команды и главное меню ─────────────────────────
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    clear_session(message.from_user.id)
+    await message.answer("👋 Добро пожаловать! Кнопка «🏠 Главное меню» всегда под рукой.", reply_markup=REPLY_KB)
+    text, kb = screen_hub(message.from_user)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("menu"))
+@dp.message(F.text == MENU_BTN)
+async def cmd_menu(message: Message):
+    clear_session(message.from_user.id)
+    text, kb = screen_hub(message.from_user)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    clear_session(message.from_user.id)
+    await message.answer("Ок, отменено.", reply_markup=REPLY_KB)
+    text, kb = screen_hub(message.from_user)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
+
+
+@dp.callback_query(F.data.startswith("noop"))
+async def cb_noop(call: CallbackQuery):
+    if call.data == "noop:pending":
+        await ack(call, "Заявка рассматривается — дождись решения 🙂", alert=True)
+    else:
+        await ack(call)
+
+
+@dp.callback_query(F.data.startswith("m:"))
+async def cb_menu(call: CallbackQuery):
+    uid = call.from_user.id
+    clear_session(uid)
+    where = call.data[2:]
+    if where == "home":
+        text, kb = screen_hub(call.from_user)
+    elif where == "dl":
+        text, kb = screen_downloads(uid)
+    elif where == "ideas":
+        text, kb = screen_ideas(uid)
+    elif where == "admin":
+        if not await need_admin(call):
+            return
+        text, kb = screen_admin()
+    else:
+        await ack(call)
+        return
+    await edit(call, text, kb)
+    await ack(call)
+
+
+# ───────────────────────── скачивание и загрузка клиента ─────────────────────────
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def cb_download(call: CallbackQuery):
+    kind = call.data.split(":")[1]
+    if kind not in KINDS:
+        await ack(call)
+        return
+    emoji, title, _ = KINDS[kind]
+    f = get_file(kind)
+    if not f:
+        await ack(call, f"{title} пока не загружен 😔", alert=True)
+        return
+    cap = f"{emoji} <b>{title}</b>\n{esc(f['file_name'])} · {fmt_size(f['file_size'])}"
+    if f["caption"]:
+        cap += f"\n\n{esc_cut(f['caption'], 600)[0]}"
+    try:
+        await bot.send_document(call.from_user.id, f["file_id"], caption=cap)
+        await ack(call, "Отправляю файл…")
+    except TelegramAPIError:
+        logging.exception("Не удалось отправить файл")
+        await ack(call, "Не удалось отправить файл. Сообщи создателю.", alert=True)
+
+
+@dp.callback_query(F.data.in_({"up:mod", "up:launcher"}))
+async def cb_upload_begin(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    kind = call.data.split(":")[1]
+    emoji, title, gen = KINDS[kind]
+    set_session(call.from_user.id, f"upload_{kind}")
+    await edit(
+        call,
+        f"⬆️ <b>Загрузка {gen}</b>\n\nОтправь файл {gen} сообщением (как документ 📎).\n"
+        f"Подпись к файлу станет описанием, например версия.",
+        KB([B("❌ Отмена", "up:cancel")]),
+    )
+    await ack(call)
+
+
+@dp.callback_query(F.data == "up:cancel")
+async def cb_upload_cancel(call: CallbackQuery):
+    clear_session(call.from_user.id)
+    text, kb = screen_downloads(call.from_user.id)
+    await edit(call, text, kb)
+    await ack(call, "Отменено")
+
+
+async def handle_upload_file(message: Message, kind):
+    emoji, title, gen = KINDS[kind]
+    doc = message.document
+    if not doc:
+        await message.answer(f"Отправь именно <b>файл</b> {gen} (📎 как документ), а не фото или текст.",
+                             reply_markup=KB([B("❌ Отмена", "up:cancel")]))
+        return
+    info = {
+        "kind": kind, "file_id": doc.file_id, "unique": doc.file_unique_id,
+        "name": doc.file_name or "file", "size": doc.file_size or 0,
+        "caption": (message.caption or "").strip()[:500],
+    }
+    uid = message.from_user.id
+    old = get_file(kind)
+    if old and old["file_unique_id"] == info["unique"]:
+        clear_session(uid)
+        await message.answer(f"ℹ️ Этот файл уже загружен как {gen}.", reply_markup=KB([B("⬇️ К загрузкам", "m:dl")]))
+        return
+    if old:
+        set_session(uid, "file_confirm", None, info)
+        await message.answer(
+            f"⚠️ <b>{title} уже загружен</b>\n\n"
+            f"Сейчас: {esc(old['file_name'])} · {fmt_size(old['file_size'])} · от {fmt_date(old['uploaded_at'])}\n"
+            f"Новый: {esc(info['name'])} · {fmt_size(info['size'])}\n\nЗаменить файл?",
+            reply_markup=KB([B("✅ Подтвердить замену", "rp:yes"), B("❌ Отмена", "rp:no")]),
+        )
+        return
+    save_file(kind, info, uid)
+    clear_session(uid)
+    await message.answer(f"✅ <b>{title} загружен!</b>\n{esc(info['name'])} · {fmt_size(info['size'])}",
+                         reply_markup=KB([B("⬇️ К загрузкам", "m:dl")]))
+
+
+@dp.callback_query(F.data.in_({"rp:yes", "rp:no"}))
+async def cb_replace(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    uid = call.from_user.id
+    sess = get_session(uid)
+    if not sess or sess["mode"] != "file_confirm":
+        await edit(call, "Это подтверждение уже неактуально.", KB([B("⬇️ К загрузкам", "m:dl")]))
+        await ack(call)
+        return
+    clear_session(uid)
+    if call.data == "rp:no":
+        await edit(call, "Замена отменена — старый файл остался.", KB([B("⬇️ К загрузкам", "m:dl")]))
+        await ack(call)
+        return
+    info = sess["data"]
+    save_file(info["kind"], info, uid)
+    title = KINDS[info["kind"]][1]
+    await edit(call, f"✅ <b>{title} заменён!</b>\n{esc(info['name'])} · {fmt_size(info['size'])}",
+               KB([B("⬇️ К загрузкам", "m:dl")]))
+    await ack(call, "Готово")
+
+
+# ───────────────────────── заявки на просмотр идей ─────────────────────────
+
+@dp.callback_query(F.data == "acc:req")
+async def cb_request_access(call: CallbackQuery):
+    u = call.from_user
+    st = access(u.id)
+    if st == "approved":
+        await ack(call, "Доступ уже есть 🙂", alert=True)
+        return
+    if st == "pending":
+        await ack(call, "Заявка уже отправлена — дождись решения.", alert=True)
+        return
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO requests(user_id,username,full_name,status,created_at) VALUES(?,?,?,?,?)",
+                    (u.id, u.username, u.full_name, "pending", now()))
+    text, kb = screen_ideas(u.id)
+    await edit(call, text, kb)
+    await ack(call, "Заявка отправлена создателю ✅", alert=True)
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                aid,
+                f"🔑 <b>Заявка на просмотр идей</b>\n\n{user_link(u.id, u.full_name, u.username)}\nID: <code>{u.id}</code>",
+                reply_markup=KB([B("✅ Одобрить", f"rqn:yes:{u.id}"), B("❌ Отклонить", f"rqn:no:{u.id}")]),
+            )
+        except TelegramAPIError:
+            pass
+
+
+async def apply_decision(action, uid):
+    """-> (успех, текст результата)"""
+    with db() as con:
+        row = con.execute("SELECT status FROM requests WHERE user_id=?", (uid,)).fetchone()
+        st = row["status"] if row else None
+        if action in ("yes", "no"):
+            if st != "pending":
+                return False, "Заявка уже обработана"
+            con.execute("UPDATE requests SET status=? WHERE user_id=?", ("approved" if action == "yes" else "rejected", uid))
+        elif action == "revoke":
+            if st != "approved":
+                return False, "У пользователя нет доступа"
+            con.execute("UPDATE requests SET status='rejected' WHERE user_id=?", (uid,))
+    try:
+        if action == "yes":
+            await bot.send_message(uid, "✅ <b>Доступ к просмотру идей одобрен!</b>",
+                                   reply_markup=KB([B("📚 Открыть идеи", "v:open")]))
+        elif action == "no":
+            await bot.send_message(uid, "❌ Заявка на просмотр идей отклонена.")
+        else:
+            await bot.send_message(uid, "🚫 Доступ к просмотру идей закрыт.")
+    except TelegramAPIError:
+        pass
+    return True, {"yes": "✅ Одобрено", "no": "❌ Отклонено", "revoke": "🚫 Доступ отозван"}[action]
+
+
+@dp.callback_query(F.data.startswith("rqn:"))
+async def cb_request_notice(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    _, action, raw = call.data.split(":")
+    ok, result = await apply_decision(action, int(raw))
+    await edit(call, f"{call.message.html_text}\n\n<b>{result}</b>")
+    await ack(call, result)
+
+
+@dp.callback_query(F.data.startswith("rq:"))
+async def cb_request_list(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    _, action, raw = call.data.split(":")
+    ok, result = await apply_decision(action, int(raw))
+    text, kb = screen_members() if action == "revoke" else screen_requests()
+    await edit(call, text, kb)
+    await ack(call, result)
+
+
+# ───────────────────────── предложение идеи и чаты ─────────────────────────
+
+@dp.callback_query(F.data == "idea:suggest")
+async def cb_suggest(call: CallbackQuery):
+    set_session(call.from_user.id, "new_idea")
+    await edit(
+        call,
+        "✍️ <b>Предложить идею</b>\n\nНапиши свою идею одним сообщением — как можно подробнее. "
+        "Я передам её создателю, а здесь откроется чат по этой идее.",
+        KB([B("❌ Отмена", "idea:cancel")]),
+    )
+    await ack(call)
+
+
+@dp.callback_query(F.data == "idea:cancel")
+async def cb_suggest_cancel(call: CallbackQuery):
+    clear_session(call.from_user.id)
+    text, kb = screen_ideas(call.from_user.id)
+    await edit(call, text, kb)
+    await ack(call, "Отменено")
+
+
+@dp.callback_query(F.data == "idea:mine")
+async def cb_my_ideas(call: CallbackQuery):
+    clear_session(call.from_user.id)
+    text, kb = screen_my_ideas(call.from_user.id)
+    await edit(call, text, kb)
+    await ack(call)
+
+
+async def handle_new_idea(message: Message):
+    text = (message.text or "").strip()
+    cancel = KB([B("❌ Отмена", "idea:cancel")])
+    if not text:
+        await message.answer("Напиши идею <b>текстом</b> ✍️\n<i>Вложения можно будет отправить позже — в чате идеи.</i>",
+                             reply_markup=cancel)
+        return
+    if len(text) < 10:
+        await message.answer("Слишком коротко 🙂 Опиши идею чуть подробнее.", reply_markup=cancel)
+        return
+    if len(text) > 3500:
+        await message.answer(f"Слишком длинно ({len(text)} символов). Сократи до 3500 — детали можно дописать в чате.",
+                             reply_markup=cancel)
+        return
+    u = message.from_user
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO suggestions(user_id,username,full_name,text,status,created_at) VALUES(?,?,?,?,?,?)",
+            (u.id, u.username, u.full_name, text, "open", now()),
+        )
+        sid = cur.lastrowid
+    log_chat(sid, "user", text)
+    similar = find_similar(text, exclude_sid=sid)
+    set_session(u.id, "chat", sid)
+    await message.answer(
+        f"✅ <b>Идея #{sid} отправлена создателю!</b>\n\n"
+        "💬 Это чат по вашей идее. Пиши сюда дополнения — они придут создателю, а его ответы появятся здесь.\n\n"
+        "<i>Выйти из чата можно кнопкой ниже. Вернуться — через «Идеи → Мои идеи».</i>",
+        reply_markup=KB([B("🚪 Выйти из чата", "sug:exit")], [B("📂 Мои идеи", "idea:mine")]),
+    )
+    sug = get_suggestion(sid)
+    body = esc_cut(text, 2500)[0]
+    notice = (f"💡 <b>Новая идея #{sid}</b>\nот {user_link(u.id, u.full_name, u.username)}\n\n{body}\n\n"
+              f"{similar_block(similar)}")
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(aid, notice, reply_markup=sug_admin_kb(sug))
+        except TelegramAPIError:
+            pass
+
+
+async def handle_user_chat(message: Message, sid):
+    u = message.from_user
+    sug = get_suggestion(sid)
+    if not sug or sug["user_id"] != u.id:
+        clear_session(u.id)
+        await message.answer("Этот чат недоступен. Открой «🏠 Главное меню».")
+        return
+    log_chat(sid, "user", msg_text(message))
+    header = f"💬 <b>Идея #{sid}</b> · {user_link(u.id, u.full_name, u.username)}"
+    sent = False
+    for aid in ADMIN_IDS:
+        try:
+            await deliver(aid, header, message, KB([B("💬 Ответить", f"sug:chat:{sid}")]))
+            sent = True
+        except TelegramAPIError:
+            pass
+    await message.answer("✅ Передано создателю" if sent else "⚠️ Не удалось передать сообщение, попробуй позже.")
+
+
+async def handle_admin_chat(message: Message, sid):
+    sug = get_suggestion(sid)
+    if not sug:
+        clear_session(message.from_user.id)
+        await message.answer("Предложение не найдено.")
+        return
+    header = f"👑 <b>Создатель</b> · идея #{sid}"
+    try:
+        await deliver(sug["user_id"], header, message, KB([B("✍️ Ответить", f"my:reply:{sid}")]))
+    except TelegramForbiddenError:
+        await message.answer("⚠️ Не доставлено: пользователь заблокировал бота.")
+        return
+    except TelegramAPIError:
+        logging.exception("Ошибка доставки")
+        await message.answer("⚠️ Не удалось доставить сообщение.")
+        return
+    log_chat(sid, "admin", msg_text(message))
+    await message.answer(f"✅ Отправлено · идея #{sid}")
+
+
+@dp.callback_query(F.data.startswith("my:"))
+async def cb_my_open(call: CallbackQuery):
+    _, mode, raw = call.data.split(":")
+    sid = int(raw)
+    sug = get_suggestion(sid)
+    if not sug or sug["user_id"] != call.from_user.id:
+        await ack(call, "Нет доступа", alert=True)
+        return
+    set_session(call.from_user.id, "chat", sid)
+    text, kb = chat_view(sug, admin=False)
+    if mode == "reply":
+        await call.message.answer(text, reply_markup=kb)
+    else:
+        await edit(call, text, kb)
+    await ack(call)
+
+
+@dp.callback_query(F.data == "sug:exit")
+async def cb_chat_exit(call: CallbackQuery):
+    clear_session(call.from_user.id)
+    if is_admin(call.from_user.id):
+        text, kb = screen_admin()
+    else:
+        text, kb = screen_ideas(call.from_user.id)
+    await edit(call, text, kb)
+    await ack(call, "Вышел из чата")
+
+
+@dp.callback_query(F.data.startswith("sug:"))
+async def cb_suggestion(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    parts = call.data.split(":")
+    action, sid = parts[1], int(parts[2])
+    sug = get_suggestion(sid)
+    if not sug:
+        await ack(call, "Предложение не найдено", alert=True)
+        return
+
+    if action in ("open", "chat"):
+        set_session(call.from_user.id, "admin_chat", sid)
+        text, kb = chat_view(sug, admin=True)
+        if action == "chat":
+            await call.message.answer(text, reply_markup=kb)
+        else:
+            await edit(call, text, kb)
+        await ack(call)
+        return
+
+    in_chat = False
+    if call.message.reply_markup:
+        in_chat = any(b.callback_data == "sug:exit" for row in call.message.reply_markup.inline_keyboard for b in row)
+
+    if action == "acc":
+        if sug["status"] == "accepted":
+            await ack(call, "Уже принята", alert=True)
+            return
+        with db() as con:
+            cur = con.execute(
+                "INSERT INTO ideas(text,status,created_at,created_by,source_suggestion) VALUES(?,?,?,?,?)",
+                (sug["text"], "new", now(), sug["user_id"], sid),
+            )
+            idea_id = cur.lastrowid
+            con.execute("UPDATE suggestions SET status='accepted', idea_id=? WHERE id=?", (idea_id, sid))
+        try:
+            await bot.send_message(
+                sug["user_id"],
+                f"🎉 <b>Твоя идея #{sid} принята в список идей!</b>\n\nСпасибо за вклад в проект 💚",
+                reply_markup=KB([B("💬 Открыть чат", f"my:reply:{sid}")]),
+            )
+        except TelegramAPIError:
+            pass
+        toast = f"Добавлено в список · идея #{idea_id}"
+    elif action == "rej":
+        if sug["status"] != "open":
+            await ack(call, "Предложение уже обработано", alert=True)
+            return
+        with db() as con:
+            con.execute("UPDATE suggestions SET status='rejected' WHERE id=?", (sid,))
+        try:
+            await bot.send_message(
+                sug["user_id"],
+                f"❌ <b>Идея #{sid} не вошла в список.</b>\n\nЕсли есть вопросы — напиши в чате идеи.",
+                reply_markup=KB([B("💬 Открыть чат", f"my:reply:{sid}")]),
+            )
+        except TelegramAPIError:
+            pass
+        toast = "Отклонено"
+    else:
+        await ack(call)
+        return
+    try:
+        await call.message.edit_reply_markup(reply_markup=sug_admin_kb(get_suggestion(sid), in_chat=in_chat))
+    except TelegramBadRequest:
+        pass
+    await ack(call, toast)
+
+
+# ───────────────────────── просмотр идей ─────────────────────────
+
+@dp.callback_query(F.data == "v:open")
+async def cb_viewer_open(call: CallbackQuery):
+    if not await need_access(call):
+        return
+    clear_session(call.from_user.id)
+    await show_idea(call, "all", 0, exact=False)
+    await ack(call)
+
+
+@dp.callback_query(F.data.startswith("i:"))
+async def cb_nav(call: CallbackQuery):
+    if not await need_access(call):
+        return
+    f, iid = parse_fi(call.data)
+    await show_idea(call, f, iid)
+    await ack(call)
+
+
+@dp.callback_query(F.data.startswith("vf:"))
+async def cb_filter(call: CallbackQuery):
+    if not await need_access(call):
+        return
+    f, iid = parse_fi(call.data)
+    await show_idea(call, f, iid, exact=False)
+    await ack(call)
+
+
+@dp.callback_query(F.data.startswith("full:"))
+async def cb_full(call: CallbackQuery):
+    if not await need_access(call):
+        return
+    idea = get_idea(int(call.data.split(":")[1]))
+    if not idea:
+        await ack(call, "Идея не найдена", alert=True)
+        return
+    lines = [f"📄 <b>Идея #{idea['id']}</b>", ""] + esc_pieces(idea["text"])
+    for chunk in pack(lines):
+        await call.message.answer(chunk)
+    await ack(call)
+
+
+@dp.callback_query(F.data.startswith(("pick:", "decl:", "ret:")))
+async def cb_change_status(call: CallbackQuery):
+    if not await need_access(call):
+        return
+    action = call.data.split(":")[0]
+    f, iid = parse_fi(call.data)
+    idea = get_idea(iid)
+    if not idea:
+        await ack(call, "Идея не найдена (возможно, удалена)", alert=True)
+        await show_idea(call, f, iid, exact=False)
+        return
+    st = idea["status"]
+    alert = toast = None
+    new_status = None
+    if action == "pick":
+        if st == "declined":
+            alert = "Идея отклонена — сначала верни её в список."
+        elif st in ("pending", "chosen"):
+            alert = "Идея уже взята."
+        else:
+            new_status, toast = "pending", "Добавлено в общий список"
+    elif action == "decl":
+        if st == "chosen":
+            alert = "Идея зафиксирована отчётом — сначала верни её в список."
+        elif st == "declined":
+            alert = "Идея уже отклонена."
+        else:
+            new_status, toast = "declined", "Идея отклонена"
+    else:  # ret
+        if st == "new":
+            alert = "Идея и так в списке."
+        else:
+            new_status, toast = "new", "Идея возвращена в список"
+    if new_status:
+        set_status(iid, new_status, call.from_user)
+    await show_idea(call, f, iid)
+    await ack(call, alert or toast, alert=bool(alert))
+
+
+@dp.callback_query(F.data.startswith("rpt:"))
+async def cb_report(call: CallbackQuery):
+    if not await need_access(call):
+        return
+    f, iid = parse_fi(call.data)
+    with db() as con:
+        taken = con.execute("SELECT * FROM ideas WHERE status IN ('pending','chosen') ORDER BY id").fetchall()
+        declined = con.execute("SELECT * FROM ideas WHERE status='declined' ORDER BY id").fetchall()
+        free = con.execute("SELECT * FROM ideas WHERE status='new' ORDER BY id").fetchall()
+        new_ids = [r["id"] for r in taken if r["status"] == "pending"]
+        con.execute("UPDATE ideas SET status='chosen' WHERE status='pending'")
+        for i in new_ids:
+            con.execute("INSERT INTO actions(idea_id,user_id,action,created_at) VALUES(?,?,?,?)",
+                        (i, call.from_user.id, "included_in_report", now()))
+
+    def entries(mark, rows, with_new=False):
+        out = []
+        if not rows:
+            return ["<i>— нет —</i>"]
+        for r in rows:
+            pcs = esc_pieces(r["text"])
+            pcs[0] = f"{mark} <b>#{r['id']}</b> — {pcs[0]}"
+            suffix = ""
+            if r["status_by_name"]:
+                suffix += f"  <i>— {esc(short(r['status_by_name'], 30))}</i>"
+            if with_new and r["id"] in new_ids:
+                suffix += " 🆕"
+            pcs[-1] += suffix
+            out.extend(pcs)
+        return out
+
+    lines = ["📋 <b>ОБЩИЙ СПИСОК ИДЕЙ</b>", ""]
+    lines += [f"🟡 <b>ВЫБРАНЫ — {len(taken)}</b>"] + entries("🟡", taken, True) + [""]
+    lines += [f"🔴 <b>ОТКЛОНЕНЫ — {len(declined)}</b>"] + entries("🔴", declined) + [""]
+    lines += [f"🟢 <b>НЕ ТРОГАЛИ — {len(free)}</b>"] + entries("🟢", free)
+    for chunk in pack(lines):
+        await call.message.answer(chunk)
+    await show_idea(call, f, iid, exact=False)
+    await ack(call, "Список сформирован. Новые выбранные отмечены 🆕")
+
+
+@dp.callback_query(F.data.startswith("edit:"))
+async def cb_edit_begin(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    iid = int(call.data.split(":")[1])
+    idea = get_idea(iid)
+    if not idea:
+        await ack(call, "Идея не найдена", alert=True)
+        return
+    set_session(call.from_user.id, "edit_idea", iid)
+    await edit(call, f"✏️ <b>Изменение идеи #{iid}</b>\n\nТекущий текст:\n{esc_cut(idea['text'], 3000)[0]}\n\n"
+                     f"Отправь новый текст одним сообщением.", KB([B("❌ Отмена", f"ed:no:{iid}")]))
+    await ack(call)
+
+
+@dp.callback_query(F.data.startswith("ed:no:"))
+async def cb_edit_cancel(call: CallbackQuery):
+    clear_session(call.from_user.id)
+    await show_idea(call, "all", int(call.data.split(":")[2]), exact=False)
+    await ack(call, "Отменено")
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete_ask(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    f, iid = parse_fi(call.data)
+    idea = get_idea(iid)
+    if not idea:
+        await ack(call, "Идея не найдена", alert=True)
+        return
+    await edit(
+        call,
+        f"🗑 <b>Удалить идею #{iid}?</b>\n\n{esc_cut(idea['text'], 1500)[0]}\n\n<i>Это действие нельзя отменить.</i>",
+        KB([B("🗑 Да, удалить", f"delyes:{f}:{iid}")], [B("⬅️ Нет, назад", f"i:{f}:{iid}")]),
+    )
+    await ack(call)
+
+
+@dp.callback_query(F.data.startswith("delyes:"))
+async def cb_delete_do(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    f, iid = parse_fi(call.data)
+    with db() as con:
+        con.execute("DELETE FROM ideas WHERE id=?", (iid,))
+        con.execute("UPDATE suggestions SET idea_id=NULL WHERE idea_id=?", (iid,))
+    await show_idea(call, f, iid, exact=False)
+    await ack(call, "Идея удалена")
+
+
+# ───────────────────────── админ-панель ─────────────────────────
+
+@dp.callback_query(F.data.startswith("adm:"))
+async def cb_admin(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    uid = call.from_user.id
+    clear_session(uid)
+    parts = call.data.split(":")
+    section = parts[1]
+    if section == "sug":
+        text, kb = screen_suggestions(len(parts) > 2 and parts[2] == "all")
+    elif section == "req":
+        text, kb = screen_requests()
+    elif section == "mem":
+        text, kb = screen_members()
+    elif section == "stat":
+        text, kb = screen_stats()
+    elif section == "add":
+        set_session(uid, "upload_ideas")
+        text = ("➕ <b>Добавить идеи</b>\n\nОтправь идеи текстом или TXT-файлом (UTF-8).\n\n"
+                "• Нумеруй пункты: <code>1. …</code>, <code>2. …</code>\n"
+                "• или разделяй идеи строкой <code>---</code>\n\nПеред сохранением покажу предпросмотр.")
+        kb = KB([B("❌ Отмена", "m:admin")])
+    elif section == "all":
+        with db() as con:
+            rows = con.execute("SELECT * FROM ideas ORDER BY id").fetchall()
+        if not rows:
+            await ack(call, "Идей пока нет", alert=True)
+            return
+        lines = [f"🗂 <b>Все идеи</b>: {len(rows)}", ""]
+        for r in rows:
+            emoji, label = status_info(r["status"])
+            pcs = esc_pieces(r["text"])
+            pcs[0] = f"{emoji} <b>#{r['id']}</b> — {pcs[0]}"
+            pcs.append(f"<i>{esc(label)}</i>" + (f" · {esc(r['status_by_name'])}" if r["status_by_name"] and r["status"] != "new" else ""))
+            pcs.append("")
+            lines.extend(pcs)
+        for chunk in pack(lines):
+            await call.message.answer(chunk)
+        await ack(call)
+        return
+    else:
+        await ack(call)
+        return
+    await edit(call, text, kb)
+    await ack(call)
+
+
+async def preview_upload(message: Message, raw):
+    uid = message.from_user.id
+    items = parse_ideas(raw)
+    if not items:
+        await message.answer("Идей не найдено. Проверь формат и попробуй ещё раз.", reply_markup=KB([B("❌ Отмена", "m:admin")]))
+        return
+    with db() as con:
+        existing = {norm_key(r["text"]) for r in con.execute("SELECT text FROM ideas")}
+    new_items = [i for i in items if norm_key(i) not in existing]
+    skipped = len(items) - len(new_items)
+    if not new_items:
+        await message.answer(f"Все {len(items)} идей уже есть в списке — добавлять нечего.",
+                             reply_markup=KB([B("⬅️ В админ-панель", "m:admin")]))
+        clear_session(uid)
+        return
+    set_session(uid, "ideas_confirm", None, {"items": new_items})
+    head = f"📝 <b>Найдено идей: {len(new_items)}</b>" + (f" · пропущено дублей: {skipped}" if skipped else "")
+    lines = [head, ""]
+    for i, item in enumerate(new_items, 1):
+        pcs = esc_pieces(item)
+        pcs[0] = f"<b>{i}.</b> {pcs[0]}"
+        lines.extend(pcs)
+        lines.append("")
+    lines.append("Проверь разделение. Сохранить?")
+    packs = pack(lines)
+    for chunk in packs[:-1]:
+        await message.answer(chunk)
+    await message.answer(packs[-1], reply_markup=KB([B("✅ Сохранить", "upi:yes"), B("❌ Отмена", "upi:no")]))
+
+
+async def handle_upload_ideas(message: Message):
+    if message.document:
+        doc = message.document
+        if not (doc.file_name or "").lower().endswith(".txt"):
+            await message.answer("Поддерживается только TXT-файл.")
+            return
+        if (doc.file_size or 0) > 2_000_000:
+            await message.answer("Файл слишком большой (макс. 2 МБ).")
+            return
+        buf = BytesIO()
+        await bot.download(doc, destination=buf)
+        try:
+            raw = buf.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await message.answer("Сохрани TXT в кодировке UTF-8 и загрузи снова.")
+            return
+    elif message.text:
+        raw = message.text
+    else:
+        await message.answer("Отправь идеи текстом или TXT-файлом.")
+        return
+    await preview_upload(message, raw)
+
+
+@dp.callback_query(F.data.in_({"upi:yes", "upi:no"}))
+async def cb_upload_ideas_confirm(call: CallbackQuery):
+    if not await need_admin(call):
+        return
+    uid = call.from_user.id
+    sess = get_session(uid)
+    if not sess or sess["mode"] != "ideas_confirm":
+        await edit(call, "Предпросмотр устарел — загрузи идеи заново.", KB([B("⬅️ В админ-панель", "m:admin")]))
+        await ack(call)
+        return
+    clear_session(uid)
+    if call.data == "upi:no":
+        await edit(call, "Загрузка отменена.", KB([B("⬅️ В админ-панель", "m:admin")]))
+        await ack(call)
+        return
+    items = sess["data"]["items"]
+    with db() as con:
+        for item in items:
+            con.execute("INSERT INTO ideas(text,status,created_at,created_by) VALUES(?,?,?,?)",
+                        (item, "new", now(), uid))
+    await edit(call, f"✅ <b>Загружено идей: {len(items)}</b>", KB([B("⬅️ В админ-панель", "m:admin")]))
+    await ack(call, "Готово")
+
+
+async def handle_edit_idea(message: Message, iid):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Отправь новый текст идеи.", reply_markup=KB([B("❌ Отмена", f"ed:no:{iid}")]))
+        return
+    with db() as con:
+        con.execute("UPDATE ideas SET text=? WHERE id=?", (text, iid))
+    clear_session(message.from_user.id)
+    await message.answer("✅ Текст обновлён")
+    await show_idea(message, "all", iid, exact=False)
+
+
+# ───────────────────────── обработка свободных сообщений ─────────────────────────
+
+@dp.message()
+async def on_message(message: Message):
+    uid = message.from_user.id
+    sess = get_session(uid)
+    if not sess:
+        text, kb = screen_hub(message.from_user)
+        await message.answer("Я понимаю только кнопки 🙂 Вот меню:", reply_markup=None)
+        await message.answer(text, reply_markup=kb)
+        return
+    mode, ref = sess["mode"], sess["ref"]
+    admin_modes = {"admin_chat", "upload_ideas", "upload_mod", "upload_launcher", "edit_idea"}
+    if mode in admin_modes and not is_admin(uid):
+        clear_session(uid)
+        return
+    if mode == "new_idea":
+        await handle_new_idea(message)
+    elif mode == "chat":
+        await handle_user_chat(message, ref)
+    elif mode == "admin_chat":
+        await handle_admin_chat(message, ref)
+    elif mode == "upload_ideas":
+        await handle_upload_ideas(message)
+    elif mode in ("upload_mod", "upload_launcher"):
+        await handle_upload_file(message, mode.split("_", 1)[1])
+    elif mode == "edit_idea":
+        await handle_edit_idea(message, ref)
+    elif mode in ("file_confirm", "ideas_confirm"):
+        await message.answer("Подтверди или отмени действие кнопками выше 👆")
+    else:
+        clear_session(uid)
+
+
+# ───────────────────────── служебное ─────────────────────────
+
+class Touch(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        u = data.get("event_from_user")
+        if u and not u.is_bot:
+            try:
+                with db() as con:
+                    con.execute(
+                        "INSERT INTO users(user_id,username,full_name,first_seen) VALUES(?,?,?,?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name",
+                        (u.id, u.username, u.full_name, now()),
+                    )
+            except Exception:
+                logging.exception("Не удалось обновить пользователя")
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(Touch())
+dp.callback_query.outer_middleware(Touch())
+
+
+@dp.error()
+async def on_error(event):
+    logging.error("Необработанная ошибка", exc_info=event.exception)
+    return True
+
+
+async def main():
+    init_db()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="menu", description="Главное меню"),
+        BotCommand(command="cancel", description="Отменить текущее действие"),
+        BotCommand(command="id", description="Узнать свой Telegram ID"),
+    ])
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
